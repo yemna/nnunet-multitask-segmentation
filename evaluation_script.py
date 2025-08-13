@@ -1,22 +1,12 @@
-#!/usr/bin/env python3
-"""
-Evaluation script for multi-task nnU-Net validation performance.
-Computes Dice scores for segmentation and macro F1 for classification.
-
-Based on the validation evaluation implementation.
-"""
-
+# Complete evaluation script for your results
 import os
 import csv
-import argparse
-from pathlib import Path
-from typing import List, Dict, Tuple
 import numpy as np
 import nibabel as nib
-from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from sklearn.metrics import f1_score, classification_report
 
-# Validation cases from the dataset split
-VALIDATION_CASES = [
+# Validation cases
+validation_cases = [
     "quiz_0_168", "quiz_0_171", "quiz_0_174", "quiz_0_184", "quiz_0_187", 
     "quiz_0_189", "quiz_0_244", "quiz_0_253", "quiz_0_254", "quiz_1_090",
     "quiz_1_093", "quiz_1_094", "quiz_1_154", "quiz_1_158", "quiz_1_164",
@@ -27,248 +17,125 @@ VALIDATION_CASES = [
     "quiz_2_379"
 ]
 
-def dice_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Calculate Dice Similarity Coefficient."""
+# Paths
+gt_seg_dir = f"{os.environ['nnUNet_raw']}/Dataset777_M31Quiz/labelsTr"
+pred_seg_dir = "D:/nnunet_with_classification/data/predictions_validation"
+gt_cls_csv = f"{os.environ['nnUNet_preprocessed']}/Dataset777_M31Quiz/classification_labels.csv"
+pred_cls_csv = "D:/nnunet_with_classification/predictions_validation/subtype_results.csv"
+
+def dice_score(y_true, y_pred):
     intersection = np.sum(y_true * y_pred)
     total = np.sum(y_true) + np.sum(y_pred)
-    
-    if total == 0:
-        return 1.0  # Both empty - perfect score
-    
-    return (2.0 * intersection) / total
+    return (2.0 * intersection) / total if total > 0 else 1.0
 
-def load_segmentation_masks(gt_dir: Path, pred_dir: Path, cases: List[str]) -> Tuple[List[float], List[float]]:
-    """Load and compute segmentation metrics for validation cases."""
-    pancreas_dices = []
-    lesion_dices = []
+# Check paths
+print("🔍 Checking paths...")
+print(f"GT segmentation dir: {os.path.exists(gt_seg_dir)}")
+print(f"Predicted segmentation dir: {os.path.exists(pred_seg_dir)}")
+print(f"GT classification CSV: {os.path.exists(gt_cls_csv)}")
+print(f"Predicted classification CSV: {os.path.exists(pred_cls_csv)}")
+
+# Calculate segmentation metrics
+pancreas_dices = []
+lesion_dices = []
+missing_files = []
+
+print("\n📊 Computing segmentation metrics...")
+for case in validation_cases:
+    gt_file = f"{gt_seg_dir}/{case}.nii.gz"
+    pred_file = f"{pred_seg_dir}/{case}.nii.gz"
     
-    missing_cases = []
-    
-    for case in cases:
-        gt_file = gt_dir / f"{case}.nii.gz"
-        pred_file = pred_dir / f"{case}.nii.gz"
-        
-        if not gt_file.exists():
-            print(f"Warning: Missing ground truth for {case}")
-            missing_cases.append(case)
-            continue
-            
-        if not pred_file.exists():
-            print(f"Warning: Missing prediction for {case}")
-            missing_cases.append(case)
-            continue
-        
+    if os.path.exists(gt_file) and os.path.exists(pred_file):
         try:
-            # Load masks
             gt = nib.load(gt_file).get_fdata()
             pred = nib.load(pred_file).get_fdata()
             
-            # Ensure same shape
-            if gt.shape != pred.shape:
-                print(f"Warning: Shape mismatch for {case}: GT {gt.shape} vs Pred {pred.shape}")
-                continue
-            
             # Whole pancreas (label > 0)
-            gt_pancreas = (gt > 0).astype(np.uint8)
-            pred_pancreas = (pred > 0).astype(np.uint8)
+            gt_pancreas = (gt > 0).astype(int)
+            pred_pancreas = (pred > 0).astype(int)
             pancreas_dice = dice_score(gt_pancreas, pred_pancreas)
             pancreas_dices.append(pancreas_dice)
             
             # Lesion only (label == 2)
-            gt_lesion = (gt == 2).astype(np.uint8)
-            pred_lesion = (pred == 2).astype(np.uint8)
+            gt_lesion = (gt == 2).astype(int)
+            pred_lesion = (pred == 2).astype(int)
             lesion_dice = dice_score(gt_lesion, pred_lesion)
             lesion_dices.append(lesion_dice)
             
+            print(f"{case}: Pancreas={pancreas_dice:.3f}, Lesion={lesion_dice:.3f}")
+            
         except Exception as e:
             print(f"Error processing {case}: {e}")
-            missing_cases.append(case)
-    
-    if missing_cases:
-        print(f"Skipped {len(missing_cases)} cases due to errors: {missing_cases[:5]}...")
-    
-    return pancreas_dices, lesion_dices
+            missing_files.append(case)
+    else:
+        missing_files.append(case)
+        print(f"Missing files for {case}")
 
-def load_classification_labels(gt_csv: Path, pred_csv: Path, cases: List[str]) -> Tuple[List[int], List[int]]:
-    """Load classification labels for validation cases."""
-    # Load ground truth labels
-    gt_labels = {}
-    if gt_csv.exists():
-        with open(gt_csv, 'r') as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) == 2:
-                    try:
-                        gt_labels[row[0]] = int(row[1])
-                    except ValueError:
-                        continue
-    
-    # Load predicted labels
-    pred_labels = {}
-    if pred_csv.exists():
-        with open(pred_csv, 'r') as f:
-            reader = csv.reader(f)
-            next(reader, None)  # Skip header if present
-            for row in reader:
-                if len(row) == 2:
-                    try:
-                        case_name = row[0].replace('.nii.gz', '')  # Remove extension
-                        pred_labels[case_name] = int(row[1])
-                    except ValueError:
-                        continue
-    
-    # Extract validation labels
-    val_gt = []
-    val_pred = []
-    missing_labels = []
-    
-    for case in cases:
-        if case in gt_labels and case in pred_labels:
-            val_gt.append(gt_labels[case])
-            val_pred.append(pred_labels[case])
-        else:
-            missing_labels.append(case)
-    
-    if missing_labels:
-        print(f"Missing classification labels for {len(missing_labels)} cases")
-    
-    return val_gt, val_pred
-
-def evaluate_model(gt_seg_dir: Path, pred_seg_dir: Path, gt_cls_csv: Path, 
-                  pred_cls_csv: Path, level: str = "phd") -> Dict:
-    """Evaluate model performance on validation set."""
-    
-    print("🔍 Starting model evaluation...")
-    print(f"📂 GT Segmentation: {gt_seg_dir}")
-    print(f"📂 Pred Segmentation: {pred_seg_dir}")
-    print(f"📄 GT Classification: {gt_cls_csv}")
-    print(f"📄 Pred Classification: {pred_cls_csv}")
-    
-    # Segmentation evaluation
-    print("\n📊 Computing segmentation metrics...")
-    pancreas_dices, lesion_dices = load_segmentation_masks(
-        gt_seg_dir, pred_seg_dir, VALIDATION_CASES
-    )
-    
-    if not pancreas_dices:
-        print("❌ No segmentation results found!")
-        return {}
-    
+if pancreas_dices:
     whole_pancreas_dsc = np.mean(pancreas_dices)
     lesion_dsc = np.mean(lesion_dices)
     
-    print(f"Processed {len(pancreas_dices)} segmentation cases")
-    
-    # Classification evaluation
-    print("\n🎯 Computing classification metrics...")
-    val_gt, val_pred = load_classification_labels(
-        gt_cls_csv, pred_cls_csv, VALIDATION_CASES
-    )
-    
-    if val_gt and val_pred:
-        macro_f1 = f1_score(val_gt, val_pred, average='macro')
-        print(f"Processed {len(val_gt)} classification cases")
-        
-        # Detailed classification report
-        print("\nClassification Report:")
-        print(classification_report(val_gt, val_pred, 
-                                  target_names=['Subtype 0', 'Subtype 1', 'Subtype 2']))
-        
-        print("\nConfusion Matrix:")
-        cm = confusion_matrix(val_gt, val_pred)
-        print(cm)
-    else:
-        macro_f1 = 0.0
-        print("❌ No classification results found!")
-    
-    # Results summary
-    results = {
-        'whole_pancreas_dsc': whole_pancreas_dsc,
-        'lesion_dsc': lesion_dsc,
-        'macro_f1': macro_f1,
-        'n_seg_cases': len(pancreas_dices),
-        'n_cls_cases': len(val_gt)
-    }
-    
-    # Performance thresholds
-    if level.lower() == "phd":
-        thresholds = {'pancreas': 0.91, 'lesion': 0.31, 'f1': 0.70}
-        level_name = "PhD"
-    else:
-        thresholds = {'pancreas': 0.85, 'lesion': 0.27, 'f1': 0.60}
-        level_name = "Undergraduate"
-    
-    print(f"\n🎓 {level_name.upper()} LEVEL REQUIREMENTS:")
-    print("=" * 50)
-    
-    # Check requirements
-    pancreas_pass = whole_pancreas_dsc >= thresholds['pancreas']
-    lesion_pass = lesion_dsc >= thresholds['lesion']
-    f1_pass = macro_f1 >= thresholds['f1']
-    
-    print(f"Whole Pancreas DSC: {whole_pancreas_dsc:.4f} ≥ {thresholds['pancreas']}: {'✅ PASS' if pancreas_pass else '❌ FAIL'}")
-    print(f"Lesion DSC: {lesion_dsc:.4f} ≥ {thresholds['lesion']}: {'✅ PASS' if lesion_pass else '❌ FAIL'}")
-    print(f"Macro F1: {macro_f1:.4f} ≥ {thresholds['f1']}: {'✅ PASS' if f1_pass else '❌ FAIL'}")
-    
-    overall_pass = pancreas_pass and lesion_pass and f1_pass
-    print(f"\n🎯 OVERALL: {'✅ PASS' if overall_pass else '❌ FAIL'}")
-    
-    if overall_pass:
-        print("🎉 Congratulations! All requirements met!")
-    else:
-        print("📈 Areas for improvement:")
-        if not pancreas_pass:
-            print(f"  • Whole pancreas segmentation needs {thresholds['pancreas'] - whole_pancreas_dsc:.4f} improvement")
-        if not lesion_pass:
-            print(f"  • Lesion segmentation needs {thresholds['lesion'] - lesion_dsc:.4f} improvement")
-        if not f1_pass:
-            print(f"  • Classification needs {thresholds['f1'] - macro_f1:.4f} improvement")
-    
-    # Store results
-    results.update({
-        'thresholds': thresholds,
-        'passes': {
-            'pancreas': pancreas_pass,
-            'lesion': lesion_pass,
-            'f1': f1_pass,
-            'overall': overall_pass
-        }
-    })
-    
-    return results
+    print(f"\n📈 Segmentation Statistics:")
+    print(f"Pancreas DSC - Mean: {whole_pancreas_dsc:.4f}, Std: {np.std(pancreas_dices):.4f}")
+    print(f"Lesion DSC - Mean: {lesion_dsc:.4f}, Std: {np.std(lesion_dices):.4f}")
+else:
+    whole_pancreas_dsc = 0.0
+    lesion_dsc = 0.0
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate multi-task nnU-Net performance")
-    parser.add_argument("--gt_seg_dir", type=Path, required=True,
-                       help="Ground truth segmentation directory")
-    parser.add_argument("--pred_seg_dir", type=Path, required=True,
-                       help="Predicted segmentation directory")
-    parser.add_argument("--gt_cls_csv", type=Path, required=True,
-                       help="Ground truth classification CSV")
-    parser.add_argument("--pred_cls_csv", type=Path, required=True,
-                       help="Predicted classification CSV")
-    parser.add_argument("--level", choices=["undergraduate", "phd"], default="phd",
-                       help="Evaluation level (undergraduate or phd)")
-    parser.add_argument("--output", type=Path,
-                       help="Optional output file for results")
-    
-    args = parser.parse_args()
-    
-    # Run evaluation
-    results = evaluate_model(
-        gt_seg_dir=args.gt_seg_dir,
-        pred_seg_dir=args.pred_seg_dir,
-        gt_cls_csv=args.gt_cls_csv,
-        pred_cls_csv=args.pred_cls_csv,
-        level=args.level
-    )
-    
-    # Save results if requested
-    if args.output and results:
-        import json
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"\n💾 Results saved to: {args.output}")
+# Classification metrics
+print("\n🎯 Computing classification metrics...")
+gt_labels = {}
+with open(gt_cls_csv, 'r') as f:
+    reader = csv.reader(f)
+    for row in reader:
+        if len(row) == 2:
+            gt_labels[row[0]] = int(row[1])
 
-if __name__ == "__main__":
-    main()
+pred_labels = {}
+with open(pred_cls_csv, 'r') as f:
+    reader = csv.reader(f)
+    next(reader)  # Skip header
+    for row in reader:
+        if len(row) == 2:
+            case_name = row[0].replace('.nii.gz', '')
+            pred_labels[case_name] = int(row[1])
+
+# Get validation classification results
+val_gt = []
+val_pred = []
+for case in validation_cases:
+    if case in gt_labels and case in pred_labels:
+        val_gt.append(gt_labels[case])
+        val_pred.append(pred_labels[case])
+
+if val_gt and val_pred:
+    macro_f1 = f1_score(val_gt, val_pred, average='macro')
+    
+    print(f"\n🔍 Classification Analysis:")
+    print(f"Ground truth distribution: {np.bincount(val_gt)}")
+    print(f"Prediction distribution: {np.bincount(val_pred)}")
+    print(f"\nDetailed Classification Report:")
+    print(classification_report(val_gt, val_pred, target_names=['Subtype 0', 'Subtype 1', 'Subtype 2']))
+else:
+    macro_f1 = 0.0
+
+# Final Results
+print("\n" + "="*70)
+print("🎓 PhD LEVEL REQUIREMENTS EVALUATION")
+print("="*70)
+print(f"Whole Pancreas DSC: {whole_pancreas_dsc:.4f} ≥ 0.91: {'✅ PASS' if whole_pancreas_dsc >= 0.91 else '❌ FAIL'}")
+print(f"Lesion DSC: {lesion_dsc:.4f} ≥ 0.31: {'✅ PASS' if lesion_dsc >= 0.31 else '❌ FAIL'}")
+print(f"Macro F1: {macro_f1:.4f} ≥ 0.70: {'✅ PASS' if macro_f1 >= 0.70 else '❌ FAIL'}")
+
+overall_pass = (whole_pancreas_dsc >= 0.91) and (lesion_dsc >= 0.31) and (macro_f1 >= 0.70)
+print(f"\n🎯 OVERALL RESULT: {'✅ PASS' if overall_pass else '❌ FAIL'}")
+
+# Summary for your report
+print(f"\n📋 SUMMARY FOR REPORT:")
+print(f"Processed {len(pancreas_dices)} segmentation cases and {len(val_gt)} classification cases")
+print(f"Whole Pancreas DSC: {whole_pancreas_dsc:.4f}")
+print(f"Lesion DSC: {lesion_dsc:.4f}")
+print(f"Classification Macro F1: {macro_f1:.4f}")
+
+if missing_files:
+    print(f"⚠️ Missing files for {len(missing_files)} cases: {missing_files}")
