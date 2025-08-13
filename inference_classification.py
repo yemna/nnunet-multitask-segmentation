@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Classification inference script for multi-task nnU-Net.
-Extracts features from trained segmentation model and performs classification inference.
+Fixed version that handles FP16/FP32 precision mismatch and MultiScaleClassificationHead.
 
 Based on the working implementation from the development notebook.
 """
@@ -15,23 +15,120 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch.nn as nn
+from typing import List
 
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
-class GlobalPoolFlatten(nn.Module):
-    """Adaptive global average pooling followed by flattening."""
-    
-    def __init__(self, ndim: int):
+class MultiScaleClassificationHead(nn.Module):
+    """
+    Multi-scale feature fusion classification head with attention mechanism
+    (Must match exactly what's in your NNUNet.py)
+    """
+    def __init__(self, encoder_channels: List[int], num_classes: int, dim: int = 3, 
+                 target_channels: int = 256, spatial_reduction: int = 4):
         super().__init__()
-        if ndim == 2:
-            self.pool = nn.AdaptiveAvgPool2d(1)
-        elif ndim == 3:
-            self.pool = nn.AdaptiveAvgPool3d(1)
+        self.num_scales = 3  # Use last 3 encoder stages
+        self.dim = dim
+        
+        # Multi-scale feature adapters
+        self.feature_adapters = nn.ModuleList()
+        
+        for channels in encoder_channels[-self.num_scales:]:
+            if dim == 3:
+                adapter = nn.Sequential(
+                    nn.AdaptiveAvgPool3d((spatial_reduction, spatial_reduction, spatial_reduction)),
+                    nn.Conv3d(channels, target_channels, kernel_size=1, bias=False),
+                    nn.BatchNorm3d(target_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout3d(0.1)
+                )
+            else:
+                adapter = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((spatial_reduction, spatial_reduction)),
+                    nn.Conv2d(channels, target_channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(target_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout2d(0.1)
+                )
+            self.feature_adapters.append(adapter)
+        
+        # Global pooling for each scale
+        if dim == 3:
+            self.global_pool = nn.AdaptiveAvgPool3d(1)
         else:
-            raise ValueError("ndim must be 2 or 3")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.flatten(self.pool(x), 1)
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Attention mechanism to weight different scales
+        self.attention = nn.Sequential(
+            nn.Linear(target_channels * self.num_scales, target_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(target_channels, self.num_scales),
+            nn.Softmax(dim=1)
+        )
+        
+        # Feature fusion
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(target_channels, target_channels),
+            nn.BatchNorm1d(target_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4)
+        )
+        
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(target_channels, target_channels // 2),
+            nn.BatchNorm1d(target_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(target_channels // 2, target_channels // 4),
+            nn.BatchNorm1d(target_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(target_channels // 4, num_classes)
+        )
+    
+    def forward(self, encoder_features):
+        """
+        Args:
+            encoder_features: List of feature tensors from encoder stages
+        Returns:
+            Classification logits [B, num_classes]
+        """
+        if len(encoder_features) < self.num_scales:
+            raise ValueError(f"Expected at least {self.num_scales} encoder features, "
+                           f"got {len(encoder_features)}")
+        
+        # Process multi-scale features
+        multi_scale_features = []
+        
+        for feat, adapter in zip(encoder_features[-self.num_scales:], self.feature_adapters):
+            # Adapt features to common channel size and spatial resolution
+            adapted = adapter(feat)
+            # Global pooling to get feature vector
+            pooled = self.global_pool(adapted).flatten(1)
+            multi_scale_features.append(pooled)
+        
+        # Stack all scale features
+        stacked_features = torch.stack(multi_scale_features, dim=1)  # [B, num_scales, target_channels]
+        
+        # Concatenate for attention computation
+        concat_features = torch.cat(multi_scale_features, dim=1)  # [B, num_scales * target_channels]
+        
+        # Compute attention weights for different scales
+        attention_weights = self.attention(concat_features)  # [B, num_scales]
+        
+        # Apply attention weights to aggregate multi-scale features
+        attention_weights = attention_weights.unsqueeze(-1)  # [B, num_scales, 1]
+        weighted_features = (stacked_features * attention_weights).sum(dim=1)  # [B, target_channels]
+        
+        # Feature fusion
+        fused_features = self.feature_fusion(weighted_features)
+        
+        # Final classification
+        logits = self.classifier(fused_features)
+        
+        return logits
 
 def setup_predictor(model_dir: Path, checkpoint_name: str, device: torch.device):
     """Initialize nnUNet predictor from trained model."""
@@ -53,9 +150,8 @@ def setup_predictor(model_dir: Path, checkpoint_name: str, device: torch.device)
     
     return predictor
 
-def load_classification_head(checkpoint_path: Path, encoder_channels: int, num_classes: int, 
-                           spatial_dims: int, device: torch.device):
-    """Load the classification head from checkpoint."""
+def load_classification_head(checkpoint_path: Path, encoder_channels: List[int], device: torch.device):
+    """Load the MultiScaleClassificationHead from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cls_state_dict = checkpoint.get("cls_state_dict", None)
     
@@ -63,21 +159,26 @@ def load_classification_head(checkpoint_path: Path, encoder_channels: int, num_c
         raise ValueError("No 'cls_state_dict' found in checkpoint. "
                         "Make sure you trained with the multi-task trainer.")
     
-    # Create classification components
-    global_pool = GlobalPoolFlatten(spatial_dims).to(device)
-    classifier = nn.Linear(encoder_channels, num_classes).to(device)
+    # Create the full MultiScaleClassificationHead
+    classifier = MultiScaleClassificationHead(
+        encoder_channels=encoder_channels,
+        num_classes=3,
+        dim=3,
+        target_channels=256,
+        spatial_reduction=4
+    ).to(device)
     
-    # Load weights
-    if "classifier" in cls_state_dict:
-        classifier.load_state_dict(cls_state_dict["classifier"], strict=False)
+    # Load the saved weights
+    try:
+        classifier.load_state_dict(cls_state_dict, strict=True)
+        print("✅ Successfully loaded MultiScaleClassificationHead weights")
+    except Exception as e:
+        raise ValueError(f"Error loading classification head: {e}")
     
-    if "global_pool" in cls_state_dict:
-        global_pool.load_state_dict(cls_state_dict["global_pool"], strict=False)
-    
-    return global_pool, classifier
+    return classifier
 
 def predict_classification(input_dir: Path, output_file: Path, model_dir: Path, 
-                         checkpoint_name: str = "checkpoint_final.pth"):
+                         checkpoint_name: str = "checkpoint_best.pth"):
     """Run classification inference on test images."""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -98,35 +199,52 @@ def predict_classification(input_dir: Path, output_file: Path, model_dir: Path,
     
     # Load classification head
     print("Loading classification head...")
-    encoder_channels = network.encoder.output_channels[-1]  # Deepest layer channels
-    spatial_dims = 3  # 3D images
-    num_classes = 3   # Subtypes 0, 1, 2
+    encoder_channels = network.encoder.output_channels
+    classifier = load_classification_head(checkpoint_path, encoder_channels, device)
     
-    global_pool, classifier = load_classification_head(
-        checkpoint_path, encoder_channels, num_classes, spatial_dims, device
-    )
-    
-    # Setup feature capture hook
-    enc_features = {"x": None}
-    def feature_hook(module, input, output):
-        enc_features["x"] = output
-    
-    hook = network.encoder.stages[-1].register_forward_hook(feature_hook)
+    # Setup feature capture hooks for all encoder stages
+    encoder_features = []
+
+    def create_hook(stage_idx):
+        def hook_fn(module, input, output):
+            while len(encoder_features) <= stage_idx:
+                encoder_features.append(None)
+            encoder_features[stage_idx] = output
+        return hook_fn
+
+    # Register hooks for all encoder stages
+    hooks = []
+    for i, stage in enumerate(network.encoder.stages):
+        hook = stage.register_forward_hook(create_hook(i))
+        hooks.append(hook)
     
     # Set models to evaluation mode
     network.eval()
     classifier.eval()
     torch.set_grad_enabled(False)
     
-    # Find test images
-    case_files = sorted(list(input_dir.glob("*_0000.nii.gz")))
-    print(f"Found {len(case_files)} test files")
+    # Find test images (handle both flat directory and subfolders)
+    case_files = []
+    
+    # Check for subfolder structure (validation case)
+    for subfolder in ["subtype0", "subtype1", "subtype2"]:
+        subfolder_path = input_dir / subfolder
+        if subfolder_path.exists():
+            files = list(subfolder_path.glob("*_0000.nii.gz"))
+            case_files.extend(files)
+    
+    # If no subfolders, check flat directory (test case)
+    if not case_files:
+        case_files = list(input_dir.glob("*_0000.nii.gz"))
+    
+    case_files = sorted(case_files)
+    print(f"Found {len(case_files)} files for classification")
     
     if len(case_files) == 0:
-        print("Warning: No test files found with pattern '*_0000.nii.gz'")
+        print("Warning: No files found with pattern '*_0000.nii.gz'")
         return
     
-    # Process each test case
+    # Process each case
     results = [("Names", "Subtype")]  # CSV header
     temp_output_dir = output_file.parent / "temp_seg_output"
     temp_output_dir.mkdir(exist_ok=True)
@@ -136,7 +254,7 @@ def predict_classification(input_dir: Path, output_file: Path, model_dir: Path,
         print(f"Processing: {img_path.name}")
         
         # Reset captured features
-        enc_features["x"] = None
+        encoder_features.clear()
         
         # Run inference (triggers feature capture)
         temp_output = temp_output_dir / f"temp_{case_id}"
@@ -161,22 +279,38 @@ def predict_classification(input_dir: Path, output_file: Path, model_dir: Path,
             results.append((case_id, prediction))
             continue
         
-        # Perform classification
-        if enc_features["x"] is not None:
-            features = enc_features["x"].float()  # Ensure float32
-            pooled_features = global_pool(features)
-            logits = classifier(pooled_features)
-            prediction = int(torch.argmax(logits, dim=1).item())
+        # Perform classification using MultiScaleClassificationHead
+        if len(encoder_features) >= 3:
+            try:
+                # Filter out None values
+                valid_features = [f for f in encoder_features if f is not None]
+                
+                if len(valid_features) >= 3:
+                    # 🔧 FIX: Convert features to float32 to match classifier weights
+                    valid_features_float = [f.float() for f in valid_features]
+                    logits = classifier(valid_features_float)
+                    prediction = int(torch.argmax(logits, dim=1).item())
+                else:
+                    print(f"Warning: Insufficient features captured for {img_path.name}")
+                    prediction = 0
+                    
+            except Exception as e:
+                print(f"Classification error for {img_path.name}: {e}")
+                prediction = 0
         else:
-            print(f"Warning: No features captured for {img_path.name}")
-            prediction = 0  # Default fallback
+            print(f"Warning: No encoder features captured for {img_path.name}")
+            prediction = 0
         
         results.append((case_id, prediction))
-        print(f"  → Classification: {prediction}")
+        print(f"  ✅ Classification: {prediction}")
     
-    # Cleanup
-    hook.remove()
-    temp_output_dir.rmdir()
+    # Cleanup hooks
+    for hook in hooks:
+        hook.remove()
+    
+    # Clean up temp directory
+    if temp_output_dir.exists():
+        temp_output_dir.rmdir()
     
     # Save results to CSV
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -201,8 +335,8 @@ def main():
                        help="Output CSV file for classification results")
     parser.add_argument("--model_dir", type=Path, required=True,
                        help="Path to trained model directory")
-    parser.add_argument("--checkpoint", type=str, default="checkpoint_final.pth",
-                       help="Checkpoint filename (default: checkpoint_final.pth)")
+    parser.add_argument("--checkpoint", type=str, default="checkpoint_best.pth",
+                       help="Checkpoint filename (default: checkpoint_best.pth)")
     
     args = parser.parse_args()
     
