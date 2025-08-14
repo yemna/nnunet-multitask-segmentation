@@ -256,10 +256,10 @@ class_weights = torch.tensor([
 
 | Metric | Achieved Score | Target (PhD) | Status |
 |--------|----------------|--------------|---------|
-| **Whole Pancreas DSC** | **0.9183** | ≥0.91 | ✅ **PASS** |
-| **Lesion DSC** | **0.6443** | ≥0.31 | ✅ **PASS** |
-| **Classification Macro F1** | **0.1961** | ≥0.70 | ❌ **FAIL** |
-| **Inference Speed Improvement** | `10%+` | ≥10% | ✅ **PASS** |
+| **Whole Pancreas DSC** | **0.9183** | ≥0.91 | ✅ **Above expectations** |
+| **Lesion DSC** | **0.6443** | ≥0.31 | ✅ **Above expectations** |
+| **Classification Macro F1** | **0.1961** | ≥0.70 |  **Expectations not met** |
+| **Inference Speed Improvement** | `10%+` | ≥10% | ✅ **Above expectations** |
 
 **Training Configuration:**
 
